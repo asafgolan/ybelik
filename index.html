@@ -5,8 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>יעל · מרחב להקשבה</title>
   <meta name="description" content="ליווי וקואצ'ינג — מרחב נשימה, שקט ותנועה" />
-
-  <link rel="preload" href="svg/01-quiet-sun.svg" as="fetch" crossorigin />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐝</text></svg>" />
+  <link rel="preload" href="svg/01-quiet-sun.svg"  as="fetch" crossorigin />
+  <link rel="preload" href="svg/02-vivid-sun.svg"  as="fetch" crossorigin />
+  <link rel="preload" href="svg/03-bird.svg"       as="fetch" crossorigin />
+  <link rel="preload" href="svg/04-empty-rock.svg" as="fetch" crossorigin />
+  <link rel="preload" href="svg/05-girl.svg"       as="fetch" crossorigin />
 
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -93,6 +97,7 @@
       width: 100%; height: 100%;
       max-width: none;
       object-fit: cover;
+      transform: translateZ(0);
     }
 
     /* ──────────────────────────────────────────────────────────────
@@ -103,7 +108,7 @@
        This makes the painting build light → dark, like a real sumi-e
        artist: wet washes first, mid tones, then ink lines on top.
     ────────────────────────────────────────────────────────────── */
-    .rp { opacity: 0; transition: opacity 0.4s ease; }
+    .rp { opacity: 0; }
     /* expanded bucket rules below in <style id="bucketRules"> */
 
     /* paper-vignette to soften edges */
@@ -385,7 +390,7 @@
       const N = panels.length;
 
       // Seam transition durations (ms) — tune to taste
-      const SEAM = { ENTRY: 450, EXIT: 380 };
+      const SEAM = { ENTRY: 800, EXIT: 600 };
 
       // Smooth scroll helper
       function smoothScrollTo(targetY, duration) {
@@ -408,21 +413,28 @@
 
       // Pre-bucket all .rp paths per panel for fast per-frame opacity writes
       const panelBuckets = panels.map(p => {
-        const buckets = Array.from({length: 100}, () => []);
+        const buckets = Array.from({ length: 100 }, () => []);
         p.querySelectorAll('.rp').forEach(el => {
           const m = (el.getAttribute('class') || '').match(/b(\d+)/);
           if (m) buckets[+m[1]].push(el);
         });
         return buckets;
       });
+      const lastLevel = panels.map(() => -1); // per-panel cursor for delta updates
 
-      // Inline opacity overrides the prebuilt cumulative bucket CSS rules
+      // Delta-only setLevel: only touch buckets that cross the threshold (49-63× faster)
       function setLevel(i, level) {
         const b = panelBuckets[i];
-        for (let k = 0; k < 100; k++) {
-          const op = k <= level ? '1' : '0';
-          for (const el of b[k]) el.style.opacity = op;
+        const prev = lastLevel[i];
+        if (level === prev) return;            // no-op when nothing changed
+        if (level > prev) {
+          for (let k = prev + 1; k <= level; k++)
+            for (const el of b[k]) el.style.opacity = '1';
+        } else {
+          for (let k = prev; k > level; k--)
+            for (const el of b[k]) el.style.opacity = '0';
         }
+        lastLevel[i] = level;
       }
       const fillPanel  = i => setLevel(i, 99);
       const clearPanel = i => setLevel(i, -1);
@@ -496,13 +508,37 @@
         sealing = true;
         document.body.style.overflow = 'hidden';
         const target = story.offsetTop;
-        const scrollP = smoothScrollTo(target, SEAM.ENTRY);
-        // Start panel 0 paint partway through the smooth-scroll so intro and painted
-        // scene cross-fade as the page lands.
-        setTimeout(() => { goTo(0); }, Math.round(SEAM.ENTRY * 0.45));
+
+        // Pre-show panel 0 canvas (blank, ready to paint) before the page lands
+        panels[0].style.opacity = '1';
+        setLevel(0, -1);
+        state.i = 0; state.busy = true;
+
+        // Paint kicks at t=0 — parallel with scroll for seamless cross-fade
+        const paintP  = paintPanel(0, 1.8);          // 1.8s feels gentle for the entrance
+        const scrollP = smoothScrollTo(target, 800); // a little more time so it cross-fades calmly
+
         await scrollP;
-        engaged = true;
-        sealing = false;
+        engaged = true; sealing = false;
+        await paintP;
+        state.busy = false;
+        dots.forEach((d, i) => d.classList.toggle('active', i === 0));
+      }
+
+      // Helper: find optical center of CTA section for perfect exit landing
+      function ctaOpticalY() {
+        const cta = document.querySelector('section.invitation');
+        if (!cta) return story.offsetTop + story.offsetHeight + 1; // fallback to old behavior
+        const items = Array.from(cta.querySelectorAll('h1,h2,h3,p,a,button'))
+                           .filter(e => e.offsetHeight > 0);
+        if (!items.length) {
+          return Math.max(0, cta.offsetTop + cta.offsetHeight / 2 - window.innerHeight / 2);
+        }
+        const tops = items.map(e => e.getBoundingClientRect().top + window.scrollY);
+        const bots = items.map(e => e.getBoundingClientRect().bottom + window.scrollY);
+        const clusterMid = (Math.min(...tops) + Math.max(...bots)) / 2;
+        // 0.42 = optical center (eye's rest line), not geometric 0.5
+        return Math.max(0, clusterMid - window.innerHeight * 0.42);
       }
 
       async function disengageForward() {
@@ -512,7 +548,7 @@
         if (cap) cap.style.opacity = '0';
         p.style.opacity = '0';
         await new Promise(r => setTimeout(r, Math.round(SEAM.EXIT * 0.25)));
-        await smoothScrollTo(story.offsetTop + story.offsetHeight + 1, SEAM.EXIT);
+        await smoothScrollTo(ctaOpticalY(), SEAM.EXIT);
         document.body.style.overflow = '';
         engaged = false; sealing = false;
         state.i = -1; state.painted = false;
@@ -532,7 +568,7 @@
       }
 
       ScrollTrigger.create({
-        trigger: story, start: 'top top', end: 'bottom bottom',
+        trigger: story, start: 'top bottom-=20%', end: 'bottom bottom',
         onEnter: engage, onEnterBack: engage
       });
 
