@@ -373,12 +373,25 @@
       initScroll();
     });
 
-    // also: hide veil as soon as the first panel is loaded
-    loadPanel(panels[0]).then(() => {
+    // Observe the existing first load via data-loaded attribute. No second fetch, no DOM swap.
+    (() => {
       const veil = document.getElementById('loadingVeil');
-      veil.classList.add('hidden');
-      setTimeout(() => veil.remove(), 700);
-    });
+      if (!veil) return;
+      const reveal = () => {
+        veil.classList.add('hidden');
+        setTimeout(() => veil.remove(), 700);
+      };
+      // Already loaded by the time this runs? (cache hit / fast network)
+      if (panels[0].dataset.loaded === '1') { reveal(); return; }
+      // Otherwise wait for loadPanel to flip data-loaded to '1'
+      const obs = new MutationObserver(() => {
+        if (panels[0].dataset.loaded === '1') {
+          obs.disconnect();
+          reveal();
+        }
+      });
+      obs.observe(panels[0], { attributes: true, attributeFilter: ['data-loaded'] });
+    })();
 
     /* ───────── Sequential, gesture-locked slideshow controller ───────── */
     function initScroll() {
