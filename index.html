@@ -71,7 +71,7 @@
     }
 
     /* ─── scroll story ───────────────────────────────────── */
-    .story { position: relative; height: 600vh; }
+    .story { position: relative; height: 100vh; }
     .stage {
       position: sticky; top: 0;
       width: 100%; height: 100vh; overflow: hidden;
@@ -83,6 +83,7 @@
       display: flex; align-items: center; justify-content: center;
       will-change: opacity;
       opacity: 0;
+      transition: opacity 0.5s ease;
     }
     .panel .svg-host {
       width: 100%; height: 100%;
@@ -126,6 +127,7 @@
         0 0 20px rgba(243, 236, 224, 0.95),
         0 0 40px rgba(243, 236, 224, 0.85),
         0 0 8px  rgba(243, 236, 224, 1);
+      transition: opacity 0.5s ease, transform 0.5s ease;
     }
     .caption.tl { top: 4vh;    left: 4vw;    text-align: left; }
     .caption.tr { top: 4vh;    right: 4vw;   text-align: right; }
@@ -373,74 +375,218 @@
       setTimeout(() => veil.remove(), 700);
     });
 
-    /* ───────── Scroll-driven painting ───────── */
+    /* ───────── Sequential, gesture-locked slideshow controller ───────── */
     function initScroll() {
       gsap.registerPlugin(ScrollTrigger);
 
-      const captions = gsap.utils.toArray('.caption');
+      const story    = document.querySelector('#story');
+      const captions = Array.from(story.querySelectorAll('.caption'));
       const dots     = gsap.utils.toArray('.progress span');
       const N = panels.length;
 
-      ScrollTrigger.create({
-        trigger: '.story',
-        start: 'top top',
-        end: 'bottom bottom',
-        scrub: 0.5,
-        onUpdate: self => {
-          const p = self.progress;
-          const segment = 1 / N;
-          const focused = Math.min(N - 1, Math.round(p / segment - 0.001));
+      // Seam transition durations (ms) — tune to taste
+      const SEAM = { ENTRY: 450, EXIT: 380 };
 
-          panels.forEach((panel, i) => {
-            const local = (p - i * segment) / segment;
+      // Smooth scroll helper
+      function smoothScrollTo(targetY, duration) {
+        return new Promise(resolve => {
+          const startY = window.scrollY;
+          const dy = targetY - startY;
+          if (Math.abs(dy) < 1 || duration <= 0) {
+            window.scrollTo(0, targetY); resolve(); return;
+          }
+          const t0 = performance.now();
+          function frame(now) {
+            const t = Math.min(1, (now - t0) / duration);
+            const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2) / 2;  // easeInOutQuad
+            window.scrollTo(0, startY + dy * e);
+            if (t < 1) requestAnimationFrame(frame); else resolve();
+          }
+          requestAnimationFrame(frame);
+        });
+      }
 
-            // "reveal" — how much of THIS panel has been painted (0..1)
-            // we use the FIRST 70% of the panel's slice for painting,
-            // last 30% holds at full + transitions out
-            let reveal;
-            if      (local < 0)    reveal = 0;
-            else if (local < 0.7)  reveal = local / 0.7;     // painting in
-            else                   reveal = 1;                // painted
+      // Pre-bucket all .rp paths per panel for fast per-frame opacity writes
+      const panelBuckets = panels.map(p => {
+        const buckets = Array.from({length: 100}, () => []);
+        p.querySelectorAll('.rp').forEach(el => {
+          const m = (el.getAttribute('class') || '').match(/b(\d+)/);
+          if (m) buckets[+m[1]].push(el);
+        });
+        return buckets;
+      });
 
-            // panel opacity — sticky-fade so the painted state persists
-            // briefly while next panel paints in over it
-            let opacity;
-            if      (local < 0)    opacity = 0;
-            else if (local < 0.05) opacity = local / 0.05;
-            else if (local < 1.0)  opacity = 1;
-            else if (local < 1.15) opacity = 1 - (local - 1.0) / 0.15;
-            else                   opacity = 0;
-
-            // Map reveal (0..1) → bucket data-reveal (0..99)
-            const bucket = Math.max(0, Math.min(99, Math.round(reveal * 99)));
-            panel.dataset.reveal = bucket;
-            panel.style.opacity = opacity.toFixed(3);
-          });
-
-          // captions appear once their panel is mostly painted (after 60% local)
-          captions.forEach((cap, i) => {
-            const local = (p - i * segment) / segment;
-            let opacity, dx;
-            if (local < 0.6 || local > 1.05) { opacity = 0; dx = 12; }
-            else {
-              const t = (local - 0.6) / 0.45;
-              opacity = Math.sin(t * Math.PI);
-              dx = (1 - opacity) * 12;
-            }
-            cap.style.opacity = opacity.toFixed(3);
-            const dir = (cap.classList.contains('tr') || cap.classList.contains('br')) ? 1 : -1;
-            cap.style.transform = `translateX(${(dx * dir).toFixed(1)}px)`;
-          });
-
-          dots.forEach((dot, i) => {
-            dot.classList.toggle('active', i === focused);
-          });
+      // Inline opacity overrides the prebuilt cumulative bucket CSS rules
+      function setLevel(i, level) {
+        const b = panelBuckets[i];
+        for (let k = 0; k < 100; k++) {
+          const op = k <= level ? '1' : '0';
+          for (const el of b[k]) el.style.opacity = op;
         }
+      }
+      const fillPanel  = i => setLevel(i, 99);
+      const clearPanel = i => setLevel(i, -1);
+
+      const state = { i: -1, painted: false, busy: false };
+
+      function paintPanel(idx, dur = 1.6) {
+        return new Promise(resolve => {
+          const obj = { v: -1 };
+          setLevel(idx, -1);
+          panels[idx].style.opacity = '1';
+          const cap = captions[idx];
+          if (cap) {
+            const dx = cap.classList.contains('tl') ? '-12px' : '12px';
+            cap.style.opacity = '0';
+            cap.style.transform = `translateX(${dx})`;
+            setTimeout(() => {
+              cap.style.opacity = '1';
+              cap.style.transform = 'translateX(0)';
+            }, dur * 1000 * 0.35);
+          }
+          gsap.to(obj, {
+            v: 99, duration: dur, ease: 'power1.out',
+            onUpdate:   () => setLevel(idx, Math.round(obj.v)),
+            onComplete: () => { setLevel(idx, 99); resolve(); }
+          });
+        });
+      }
+
+      function hidePanel(idx, dur = 0.45) {
+        return new Promise(resolve => {
+          const cap = captions[idx];
+          if (cap) cap.style.opacity = '0';
+          panels[idx].style.opacity = '0';
+          setTimeout(() => { clearPanel(idx); resolve(); }, dur * 1000);
+        });
+      }
+
+      async function goTo(target) {
+        if (state.busy || target < 0 || target >= N) return;
+        state.busy = true;
+        if (state.i >= 0 && state.i !== target) await hidePanel(state.i);
+        state.i = target;
+        state.painted = false;
+        await paintPanel(target);
+        state.painted = true;
+        state.busy = false;
+        dots.forEach((dot, i) => dot.classList.toggle('active', i === target));
+      }
+
+      async function jumpToPainted(target) {
+        if (state.busy || target < 0 || target >= N) return;
+        state.busy = true;
+        if (state.i >= 0 && state.i !== target) await hidePanel(state.i, 0.35);
+        state.i = target;
+        panels[target].style.opacity = '1';
+        fillPanel(target);
+        const cap = captions[target];
+        if (cap) { cap.style.opacity = '1'; cap.style.transform = 'translateX(0)'; }
+        state.painted = true;
+        state.busy = false;
+        dots.forEach((dot, i) => dot.classList.toggle('active', i === target));
+      }
+
+      // Engage / disengage scroll capture with smooth seam transitions
+      let engaged = false;
+      let sealing = false;  // entering or leaving — input is locked the whole time
+
+      async function engage() {
+        if (engaged || sealing) return;
+        sealing = true;
+        document.body.style.overflow = 'hidden';
+        const target = story.offsetTop;
+        const scrollP = smoothScrollTo(target, SEAM.ENTRY);
+        // Start panel 0 paint partway through the smooth-scroll so intro and painted
+        // scene cross-fade as the page lands.
+        setTimeout(() => { goTo(0); }, Math.round(SEAM.ENTRY * 0.45));
+        await scrollP;
+        engaged = true;
+        sealing = false;
+      }
+
+      async function disengageForward() {
+        if (!engaged || sealing) return;
+        sealing = true;
+        const p = panels[N - 1], cap = captions[N - 1];
+        if (cap) cap.style.opacity = '0';
+        p.style.opacity = '0';
+        await new Promise(r => setTimeout(r, Math.round(SEAM.EXIT * 0.25)));
+        await smoothScrollTo(story.offsetTop + story.offsetHeight + 1, SEAM.EXIT);
+        document.body.style.overflow = '';
+        engaged = false; sealing = false;
+        state.i = -1; state.painted = false;
+      }
+
+      async function disengageBackward() {
+        if (!engaged || sealing) return;
+        sealing = true;
+        const p = panels[0], cap = captions[0];
+        if (cap) cap.style.opacity = '0';
+        p.style.opacity = '0';
+        await new Promise(r => setTimeout(r, Math.round(SEAM.EXIT * 0.25)));
+        await smoothScrollTo(Math.max(0, story.offsetTop - window.innerHeight), SEAM.EXIT);
+        document.body.style.overflow = '';
+        engaged = false; sealing = false;
+        state.i = -1; state.painted = false;
+      }
+
+      ScrollTrigger.create({
+        trigger: story, start: 'top top', end: 'bottom bottom',
+        onEnter: engage, onEnterBack: engage
+      });
+
+      // One gesture = one step. Lock during animation; ignore inertia tail.
+      const COOLDOWN_MS = 250;
+      let lastStepAt = 0, wheelLockUntil = 0, touchStartY = null;
+
+      async function step(dir) {
+        if (!engaged || sealing) return;
+        if (state.busy) return;
+        if (performance.now() < lastStepAt + COOLDOWN_MS) return;
+        if (dir > 0) {
+          if (state.i < N - 1) await goTo(state.i + 1);
+          else disengageForward();
+        } else {
+          if (state.i > 0) await jumpToPainted(state.i - 1);
+          else disengageBackward();
+        }
+        lastStepAt = performance.now();
+      }
+
+      window.addEventListener('wheel', e => {
+        if (!engaged && !sealing) return;  // outside slideshow → native scroll
+        e.preventDefault();
+        const now = performance.now();
+        if (now < wheelLockUntil) return;
+        if (Math.abs(e.deltaY) < 4) return;
+        wheelLockUntil = now + 350;
+        if (engaged && !sealing) step(e.deltaY > 0 ? 1 : -1);  // step only when fully engaged
+      }, { passive: false });
+
+      window.addEventListener('touchstart', e => {
+        if (engaged || sealing) touchStartY = e.touches[0].clientY;
+      }, { passive: true });
+      window.addEventListener('touchmove',  e => {
+        if (engaged || sealing) e.preventDefault();
+      }, { passive: false });
+      window.addEventListener('touchend',   e => {
+        if (!engaged || sealing || touchStartY === null) return;
+        const dy = touchStartY - e.changedTouches[0].clientY;
+        touchStartY = null;
+        if (Math.abs(dy) >= 30) step(dy > 0 ? 1 : -1);
+      }, { passive: true });
+
+      window.addEventListener('keydown', e => {
+        if (!engaged) return;
+        if (sealing) { e.preventDefault(); return; }  // swallow keys mid-seam
+        if (['ArrowDown','PageDown',' ','Spacebar','Enter'].includes(e.key)) { e.preventDefault(); step(1); }
+        else if (['ArrowUp','PageUp'].includes(e.key)) { e.preventDefault(); step(-1); }
       });
 
       // accessibility
       if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-        panels.forEach(p => { p.style.opacity = 1; p.dataset.reveal = 99; });
+        panels.forEach((p, i) => { p.style.opacity = 1; fillPanel(i); });
         captions.forEach(c => { c.style.opacity = 1; c.style.transform = 'none'; });
       }
     }
